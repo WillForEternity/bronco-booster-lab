@@ -1,0 +1,26 @@
+# Checks that run at every `git commit`. Runs on: laptop.
+#   uv pip install --python .venv/bin/python -r requirements-dev.txt
+#   .venv/bin/pre-commit install          # once per clone
+#   .venv/bin/pre-commit run --all-files  # by hand
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10  # keep equal to ruff in requirements-dev.txt
+    hooks:
+      - id: ruff-check
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: detect-private-key
+  - repo: local
+    hooks:
+      - id: no-models-or-videos
+        name: no robot models, checkpoints, motions or videos (see AGENTS.md)
+        language: fail
+        entry: "Booster's models, checkpoints and motions, and videos, stay out of Git. Blocked:"
+        files: \.(pt|onnx|npz|ckpt|stl|urdf|xml|mp4)$
+        exclude: ^tests/fixtures/

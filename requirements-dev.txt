@@ -1,0 +1,7 @@
+# Laptop dev tools and what the unit tests import (tests/). Runs on: laptop.
+#   uv pip install --python .venv/bin/python -r requirements-dev.txt
+pytest==9.1.1
+ruff==0.16.10
+torch==2.14.1
+numpy==2.4.6
+pre-commit==4.6.2

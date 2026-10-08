@@ -1,0 +1,12 @@
+# Booster's MuJoCo player (booster_deploy) on a laptop, at the versions this repository was tested with.
+# Runs on: laptop. Install into booster_deploy's environment (see README.md).
+torch==2.14.1
+numpy==2.4.6
+scipy==1.17.1
+pyyaml==6.0.3
+mujoco==3.15.0
+onnxruntime==1.30.0
+# Only for recording videos (record_stage.py, final_test.py):
+imageio==2.38.0
+imageio-ffmpeg==0.6.0
+opencv-python-headless==5.0.0.93

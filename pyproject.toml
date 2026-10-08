@@ -1,0 +1,26 @@
+# Tool settings only (lint and tests).
+#
+# Runs on: laptop, in the repository's .venv:
+#   uv pip install --python .venv/bin/python -r requirements-dev.txt
+#   .venv/bin/ruff check .
+#   .venv/bin/pytest
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+extend-exclude = [".upstream", "artifacts", "runs"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["demo/speed_ramp"]
+
+[tool.ruff.lint.per-file-ignores]
+# Isaac Lab idioms: quoted forward references on manager terms, SceneEntityCfg defaults in reward functions.
+"demo/speed_ramp/k1_speed_env.py" = ["UP037", "B008"]
+
+[tool.uv]
+# Not a uv project: `uv run` here must not create its own .venv or uv.lock (booster_deploy has the runtime env).
+managed = false
