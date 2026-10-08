@@ -1,42 +1,13 @@
-"""Resuming a version-3 run (demo/speed_ramp/run_state.py). Runs on: laptop."""
+"""Run bookkeeping: hashes, provenance, and resuming a run (demo/speed_ramp/run_state.py). Runs on: laptop."""
 
-from types import SimpleNamespace
+import hashlib
 
-from run_state import code_provenance, curriculum_state, latest_checkpoint
+import pytest
+from run_state import code_provenance, latest_checkpoint, merge_resume_args, sha256_file
 
-ARGS = SimpleNamespace(start_speed=1.0, step=0.25, warmup=100)
-
-# Shape of a real run's ramp_events.jsonl (version 3, seed 1, abridged).
-EVENTS = [
-    {"event": "start", "version": 3},
-    {"event": "actor_unfrozen", "iteration": 99},
-    {"event": "validation_failed", "target": 1.0, "iteration": 1000},
-    {"event": "target_hit", "stage": 1, "target": 1.0, "iteration": 1300},
-    {"event": "target_hit", "stage": 2, "target": 1.25, "iteration": 1600},
-    {"event": "validation_failed", "target": 1.5, "iteration": 1800},
-    {"event": "target_hit", "stage": 3, "target": 1.5, "iteration": 1900},
-    {"event": "stalled", "target": 1.75, "iteration": 4900},
-]
-
-
-def test_state_after_last_promotion():
-    s = curriculum_state(EVENTS, ARGS, up_to=1950)
-    assert s == {"stage": 3, "v_max": 1.75, "level_start": 1900, "last_mj_try": 1900, "stall_logged": False}
-
-
-def test_events_after_the_checkpoint_are_ignored():
-    # Resuming from iteration 1750: the 1800 failure and the 1900 promotion are redone.
-    s = curriculum_state(EVENTS, ARGS, up_to=1750)
-    assert s == {"stage": 2, "v_max": 1.5, "level_start": 1600, "last_mj_try": 1600, "stall_logged": False}
-
-
-def test_fresh_run_state():
-    s = curriculum_state(EVENTS[:2], ARGS, up_to=150)
-    assert s == {"stage": 0, "v_max": 1.0, "level_start": 100, "last_mj_try": None, "stall_logged": False}
-
-
-def test_stall_on_current_level_is_remembered():
-    assert curriculum_state(EVENTS, ARGS, up_to=5000)["stall_logged"]
+KEYS = ("seed", "step", "patience")
+DEFAULTS = {"seed": 1, "step": 0.25, "patience": 1000, "max_iterations": 20000, "resume": None}
+SAVED = {"seed": 2, "step": 0.5, "patience": 800, "max_iterations": 20000, "resume": None}
 
 
 def test_latest_checkpoint_prefers_the_later_iteration(tmp_path):
@@ -50,6 +21,40 @@ def test_latest_checkpoint_prefers_the_later_iteration(tmp_path):
     assert latest_checkpoint(str(tmp_path))[1] == 2000
 
 
+def test_latest_checkpoint_ignores_the_baseline(tmp_path):
+    (tmp_path / "stages").mkdir()
+    (tmp_path / "stages" / "stage_00_k1_walk_baseline.pt").write_bytes(b"")
+    with pytest.raises(FileNotFoundError):
+        latest_checkpoint(str(tmp_path))
+
+
+def test_resume_uses_the_runs_own_arguments():
+    current = DEFAULTS | {"resume": "/runs/x", "max_iterations": 30000}
+    merged = merge_resume_args(SAVED, current, DEFAULTS, KEYS)
+    assert merged == {"seed": 2, "step": 0.5, "patience": 800, "max_iterations": 30000, "resume": "/runs/x"}
+
+
+def test_resume_accepts_a_flag_equal_to_the_runs_value():
+    assert merge_resume_args(SAVED, DEFAULTS | {"seed": 2}, DEFAULTS, KEYS)["seed"] == 2
+
+
+def test_resume_refuses_a_flag_that_changes_the_run():
+    with pytest.raises(ValueError, match=r"--step 0.75 \(run: 0.5\)"):
+        merge_resume_args(SAVED, DEFAULTS | {"step": 0.75}, DEFAULTS, KEYS)
+
+
+def test_resume_refuses_a_run_from_older_code():
+    with pytest.raises(ValueError, match="older train_v3.py"):
+        merge_resume_args({"seed": 2, "step": 0.5}, DEFAULTS, DEFAULTS, KEYS)
+
+
+def test_sha256_file(tmp_path):
+    p = tmp_path / "f.bin"
+    p.write_bytes(b"k1" * 1_000_000)
+    assert sha256_file(str(p)) == hashlib.sha256(b"k1" * 1_000_000).hexdigest()
+
+
 def test_code_provenance_hashes_the_scripts():
     p = code_provenance()
-    assert "train_v3.py" in p["sha256"] and len(p["sha256"]["train_v3.py"]) == 64
+    for name in ("train_v3.py", "criteria.py", "curriculum.py", "k1_conventions.py"):
+        assert len(p["sha256"][name]) == 64

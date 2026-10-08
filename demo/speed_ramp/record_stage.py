@@ -1,71 +1,34 @@
-"""Record a K1 walking policy in booster_deploy's MuJoCo player, headless: labeled MP4 + metrics JSON.
+"""Record one policy at one speed in booster_deploy's MuJoCo player, off-screen: a labeled MP4 and a metrics JSON.
 
-Runs on: GPU host or laptop, inside an environment with booster_deploy's requirements plus mujoco,
-opencv-python-headless and imageio-ffmpeg, from booster_deploy's repository root:
-    python record_stage.py --checkpoint <policy.pt> --speed 2.5 --out videos/x.mp4 \
-        --label "Booster k1_walk fine-tuned by Bronco Robotics | reward: shaped | stage 7"
+Runs on: GPU host or laptop, in booster_deploy's environment (with opencv-python-headless and imageio-ffmpeg,
+see requirements-laptop.txt), from booster_deploy's repository root:
+    python <repo>/demo/speed_ramp/record_stage.py --checkpoint <policy.pt> --speed 2.0 --damping_profile v3 \
+        --out videos/x.mp4 --label "Booster k1_walk fine-tuned by Bronco Robotics | seed 1 | stage 5"
 
 Uses booster_deploy's k1_walk task and MujocoController unchanged (gains, observation, torque
 limits, fall detector); only the viewer is replaced by an off-screen renderer. The player has no
-randomness, so the same checkpoint, speed and versions give the same video.
+randomness, so on one computer the same checkpoint, speed and versions give the same video.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
-import hashlib
 import json
 import os
-import pkgutil
 import platform
-import sys
 
-if platform.system() == "Linux":
-    os.environ.setdefault("MUJOCO_GL", "egl")
+from booster_player import fixed_speed_controller, k1_walk_cfg  # first: sets MUJOCO_GL before mujoco is imported
 
-import cv2  # noqa: E402
-import imageio.v2 as imageio  # noqa: E402
-import mujoco  # noqa: E402
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
+import cv2
+import imageio.v2 as imageio
+import mujoco
+import numpy as np
+import torch
 
-sys.path.append(".")
-import tasks as tasks_pkg  # noqa: E402
-
-for _mod in pkgutil.walk_packages(tasks_pkg.__path__, prefix="tasks."):
-    __import__(_mod.name)
-from booster_deploy.controllers.mujoco_controller import MujocoController  # noqa: E402
-from booster_deploy.utils.registry import get_task  # noqa: E402
-
-# Joint damping profiles for booster_deploy's MuJoCo player. "v3": only the two arm joints whose explicit PD is
-# unstable at 2 ms in some postures (damping x dt / inertia: elbow pitch 2.69, shoulder pitch 1.94) are lowered,
-# to 0.7 and 1.0 (worst-case ratio ~0.95). Shoulder roll and elbow yaw keep Booster's 2.0.
-DAMPING_PROFILES = {"v3": {"shoulder_pitch": 1.0, "elbow_pitch": 0.7}}
-
-
-def set_damping_profile(cfg, profile: str | None) -> None:
-    """Apply a damping profile to a booster_deploy task config (None keeps Booster's values)."""
-    if not profile:
-        return
-    rules = DAMPING_PROFILES[profile]
-    damping = list(cfg.robot.joint_damping)
-    for i, n in enumerate(cfg.robot.joint_names):
-        for key, kd in rules.items():
-            if key in n:
-                damping[i] = kd
-    cfg.robot.joint_damping = damping
-
+from k1_conventions import DAMPING_PROFILES
+from run_state import sha256_file
 
 WHITE, RED, GREY, GREEN = (255, 255, 255), (255, 70, 70), (190, 190, 190), (120, 230, 120)
-
-
-def sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _band(img, y0, y1, alpha=0.55):
@@ -77,16 +40,10 @@ def _text(img, s, y, color=WHITE, scale=0.55, thick=1):
 
 
 def record(checkpoint: str | None, speed: float, out: str, label: str, seconds: float = 10.0, fps: int = 25,
-           width: int = 960, height: int = 540, damping_profile: str | None = None) -> dict:
+           width: int = 1024, height: int = 576, damping_profile: str | None = None) -> dict:
     torch.set_num_threads(1)
-    cfg = copy.deepcopy(get_task("k1_walk"))  # the registry object is shared
-    cfg.policy.device = "cpu"
-    set_damping_profile(cfg, damping_profile)
-    if checkpoint:
-        cfg.policy.checkpoint_path = os.path.abspath(checkpoint)
-    ctrl = MujocoController(cfg)
-    ctrl.update_vel_command = lambda: None  # the player otherwise reads new commands from stdin
-    ctrl.vel_command.lin_vel_x, ctrl.vel_command.lin_vel_y, ctrl.vel_command.ang_vel_yaw = speed, 0.0, 0.0
+    cfg = k1_walk_cfg(checkpoint, damping_profile)
+    ctrl = fixed_speed_controller(cfg, speed)
 
     ctrl.mj_model.vis.global_.offwidth = max(width, ctrl.mj_model.vis.global_.offwidth)
     ctrl.mj_model.vis.global_.offheight = max(height, ctrl.mj_model.vis.global_.offheight)
@@ -99,7 +56,7 @@ def record(checkpoint: str | None, speed: float, out: str, label: str, seconds: 
     every = max(1, round(1.0 / (fps * dt)))
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     writer = imageio.get_writer(out, fps=fps, codec="libx264", pixelformat="yuv420p", quality=8,
-                                macro_block_size=8)
+                                macro_block_size=16)  # 1024 x 576 divides evenly, so frames are not resized
 
     pos, upright = [], []
     stop_t = None
@@ -144,7 +101,7 @@ def record(checkpoint: str | None, speed: float, out: str, label: str, seconds: 
     steady_speed = (np.linalg.norm(steady[-1, :2] - steady[0, :2]) / ((len(steady) - 1) * dt)) if len(steady) > 1 else 0.0
     metrics = {
         "checkpoint": os.path.abspath(checkpoint) if checkpoint else "booster_deploy k1_walk.pt (Booster's)",
-        "checkpoint_sha256": sha256(cfg.policy.checkpoint_path if os.path.isabs(cfg.policy.checkpoint_path)
+        "checkpoint_sha256": sha256_file(cfg.policy.checkpoint_path if os.path.isabs(cfg.policy.checkpoint_path)
                                     else os.path.join("tasks/locomotion", cfg.policy.checkpoint_path)),
         "label": label,
         "commanded_speed_mps": speed,
@@ -160,20 +117,25 @@ def record(checkpoint: str | None, speed: float, out: str, label: str, seconds: 
         "fps": fps,
         "versions": {"mujoco": mujoco.__version__, "torch": torch.__version__, "python": platform.python_version(),
                      "platform": platform.platform()},
-        "recorder_sha256": sha256(__file__),
+        "recorder_sha256": sha256_file(__file__),
     }
     with open(os.path.splitext(out)[0] + ".json", "w") as f:
         json.dump(metrics, f, indent=2)
     return metrics
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=None, help="exported policy .pt; default is Booster's k1_walk")
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--checkpoint", default=None, help="exported policy; default is Booster's k1_walk")
     ap.add_argument("--speed", type=float, required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", required=True, help="MP4 path; the metrics JSON is written next to it")
     ap.add_argument("--label", default="Booster's k1_walk (unchanged)")
     ap.add_argument("--seconds", type=float, default=10.0)
-    ap.add_argument("--damping_profile", default=None)
+    ap.add_argument("--damping_profile", choices=sorted(DAMPING_PROFILES), default=None,
+                    help="v3 for policies from train_v3.py; omit for Booster's k1_walk")
     a = ap.parse_args()
     print(json.dumps(record(a.checkpoint, a.speed, a.out, a.label, a.seconds, damping_profile=a.damping_profile), indent=2))
+
+
+if __name__ == "__main__":
+    main()

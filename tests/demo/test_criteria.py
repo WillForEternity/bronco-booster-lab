@@ -1,10 +1,14 @@
-"""Final-test criteria (RECIPE.md, notes 3-7) and speed measures. Runs on: laptop."""
+"""Pass/fail rules shared by the training gate and the final test (RECIPE.md, notes 3-7), and the final test's
+bookkeeping. Runs on: laptop."""
 
+import json
 import math
 from types import SimpleNamespace
 
 import pytest
-from final_test import STAGE_RE, recipe_result, run_result, stage_criteria
+from criteria import GAIT_KEYS, recipe_result, run_result, stage_criteria, survivor_gait_means
+from final_test import find_stages, write_summary
+from run_state import STAGE_RE
 from speed_metrics import epte_sp, heading_speed
 
 
@@ -16,12 +20,21 @@ def trial(survived=True, fwd=1.0, steady=None, epte=0.05, asym=0.05, flight=0.1)
 
 
 def test_success_needs_survival_and_own_speed():
-    # Amendment 3: 18 fast survivors + 2 that stand still pass only if 18 >= min_success.
-    trials = [trial(fwd=1.52)] * 18 + [trial(fwd=0.02)] * 2
-    c = stage_criteria(trials, 1.5)
+    # Note 3: 18 fast survivors + 2 that stand still pass only if 18 >= min_success.
+    c = stage_criteria([trial(fwd=1.52)] * 18 + [trial(fwd=0.02)] * 2, 1.5)
     assert (c["successes"], c["passes"]) == (18, True)
     c = stage_criteria([trial(fwd=1.52)] * 17 + [trial(fwd=0.02)] * 3, 1.5)
     assert (c["successes"], c["passes"]) == (17, False)
+
+
+def test_survivor_mean_cannot_hide_slow_trials():
+    # The case that motivated the shared rule: every trial survives and the survivors' mean speed clears 90%,
+    # but most trials are individually slow. A mean-speed gate would pass this; the per-trial rule does not.
+    trials = [trial(fwd=1.30)] * 8 + [trial(fwd=0.80)] * 12
+    mean = sum(t["forward_speed_mps"] for t in trials) / len(trials)
+    assert mean >= 0.9 * 1.0
+    c = stage_criteria(trials, 1.0)
+    assert c["survived"] == 20 and c["successes"] == 8 and not c["passes"]
 
 
 def test_fallen_trials_never_succeed():
@@ -39,6 +52,13 @@ def test_speed_metric_choice():
     trials = [trial(fwd=0.85, steady=0.95)] * 20
     assert not stage_criteria(trials, 1.0, metric="forward")["passes"]
     assert stage_criteria(trials, 1.0, metric="steady")["passes"]
+    with pytest.raises(ValueError):
+        stage_criteria(trials, 1.0, metric="sideways")
+
+
+def test_command_must_be_positive():
+    with pytest.raises(ValueError):
+        stage_criteria([trial()], 0.0)
 
 
 def test_overshoot_flag_uses_median_error():
@@ -51,6 +71,13 @@ def test_symmetry_flag():
     assert not stage_criteria([trial(asym=0.11)] * 20, 1.0)["symmetric"]
 
 
+def test_gait_means_use_survivors_only():
+    means = survivor_gait_means([trial(flight=0.2), trial(flight=0.4), trial(survived=False)])
+    assert set(means) == set(GAIT_KEYS)
+    assert means["flight_fraction"] == pytest.approx(0.3)
+    assert survivor_gait_means([trial(survived=False)])["flight_fraction"] is None
+
+
 def stage(n, v, passes):
     return {"stage": n, "v_max": v, "checkpoint": f"s{n}.pt", "criteria": {"passes": passes, "symmetric": True}}
 
@@ -60,7 +87,7 @@ def test_run_result_is_highest_passing_stage_even_after_a_failure():
     assert run_result([stage(1, 1.0, False)]) is None
 
 
-def test_recipe_result_is_the_lower_seed():
+def test_recipe_result_is_the_lowest_seed():
     r = recipe_result({"seed1": {"v_max": 2.0}, "seed2": {"v_max": 1.75}})
     assert (r["v_max"], r["limited_by"]) == (1.75, "seed2")
     assert recipe_result({"seed1": {"v_max": 2.0}, "seed2": None})["v_max"] is None
@@ -70,6 +97,31 @@ def test_stage_names():
     m = STAGE_RE.search("runs/x/stages/stage_05_vmax2.00_it2500.pt")
     assert m.groups() == ("05", "2.00", "2500")
     assert STAGE_RE.search("stage_00_k1_walk_baseline.pt") is None
+
+
+def test_find_stages_skips_the_baseline(tmp_path):
+    stages = tmp_path / "2026-10-08_01-50-19_seed1" / "stages"
+    stages.mkdir(parents=True)
+    for name in ("stage_00_k1_walk_baseline.pt", "stage_01_vmax1.00_it1300.pt", "stage_02_vmax1.25_it1600.pt"):
+        (stages / name).write_bytes(b"")
+    found = find_stages(str(tmp_path))
+    assert [(s["run"], s["stage"], s["v_max"], s["iteration"]) for s in found] == [
+        ("2026-10-08_01-50-19_seed1", 1, 1.0, 1300), ("2026-10-08_01-50-19_seed1", 2, 1.25, 1600)]
+
+
+def test_write_summary(tmp_path):
+    args = {"trials": 20, "seed0": 1000, "damping_profile": "v3", "speed_metric": "forward", "seconds": 10.0,
+            "speed_ratio": 0.9, "min_success": 18}
+    results = []
+    for run, v, fwd in (("seed1", 2.0, 2.05), ("seed2", 2.0, 2.02), ("seed2", 2.25, 1.5)):
+        results.append({"run": run, "stage": int(v * 4 - 3), "v_max": v, "iteration": 100, "checkpoint": f"{run}_{v}.pt",
+                        "criteria": stage_criteria([trial(fwd=fwd)] * 20, v)})
+    summary = write_summary(str(tmp_path), results, args)
+    assert summary["recipe"]["v_max"] == 2.0
+    assert json.loads((tmp_path / "summary.json").read_text())["per_run"]["seed2"]["v_max"] == 2.0
+    md = (tmp_path / "summary.md").read_text()
+    assert "| seed2 | 6 | 2.25 | 0/20 | no |" in md
+    assert "- Recipe (lowest of the runs): 2.00 m/s" in md
 
 
 def test_epte_sp():

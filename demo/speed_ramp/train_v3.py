@@ -1,42 +1,35 @@
-"""Version 3: one recipe for a fast, natural K1 run (RECIPE.md; k1_speed_env.py, version 3 notes).
+"""Train the version-3 recipe: fine-tune Booster's k1_walk for speed (RECIPE.md).
 
-What it trains with:
-- the version-3 task (energy-aware reward; arm-deviation penalty, recipe note 1; implicit arm and
-  head PD with two lower arm dampings, recipe note 2; wider randomization: 0-40 ms delay, friction
-  0.4-1.2, motor gains x0.8-1.2);
-- symmetry-augmented PPO (k1_symmetry.py);
-- a MuJoCo validation gate: after the Isaac gate passes, the candidate is exported and run in
-  booster_deploy's MuJoCo player for 20 perturbed trials (seeds 0-19) at the new v_max. It is
-  promoted only if >= --mj_min_survive trials survive at >= --mj_speed_ratio x v_max. A failed
-  check is logged ("validation_failed") and retried after --mj_cooldown iterations. If the check
-  itself breaks (crash, timeout, unreadable output), it is logged ("validation_error", with the
-  evaluator's stderr in candidates/) and retried the same way; training continues. MuJoCo seeds
-  1000+ are reserved for the final test (final_test.py) and never used here.
-
-Runs on: GPU host.
+Runs on: GPU host, with the training environment active (Docs/runbooks/golden_env.md):
     python train_v3.py --seed 1 --run_name seed1
-    python train_v3.py --seed 1 --run_name seed1 --resume /workspace/runs/k1_run_v3/<run>   # after a crash
+    python train_v3.py --resume /workspace/runs/k1_run_v3/<run>      # continue a run after a crash
 
---resume continues a run in its own folder from its latest checkpoint (model_<it>.pt or a stage
-checkpoint, whichever is later), with the optimizer state, and rebuilds the curriculum (v_max,
-stage, level start, last gate attempt) from ramp_events.jsonl up to that iteration. Iterations
-after the checkpoint are redone. The tracking window starts empty, so the Isaac gate cannot pass
-for --window iterations, and the adaptive learning rate restarts from its configured value.
+What it does:
+- loads Booster's k1_walk actor and trains a new critic for --warmup iterations with the actor frozen;
+- trains the version-3 task (k1_speed_env.py) with symmetry-augmented PPO (k1_symmetry.py);
+- raises the target speed v_max by --step each time a level passes both gates (curriculum.py):
+  * Isaac gate: tracking and fall rate at the frontier over the last --window iterations;
+  * MuJoCo gate: the exported candidate runs --gate_trials perturbed trials (seeds 0-19) in booster_deploy's MuJoCo
+    player at v_max, under the final test's rule (criteria.py): it passes with >= --gate_min_successes trials that
+    survive at >= --gate_speed_ratio x v_max. Seeds 1000+ belong to the final test (final_test.py);
+- stops when a level runs --patience iterations without promotion (recipe note 6), or at --max_iterations.
 
-Each launch records the SHA-256 of every .py file next to this script (and the Git commit, if
-any) in <run>/params/code_<timestamp>.json.
+A failed MuJoCo check is logged ("validation_failed") and retried after --gate_cooldown iterations. A check that
+breaks (crash, timeout, unreadable output) is logged ("validation_error", with the evaluator's output in
+candidates/) and retried the same way: the gate never takes training down.
 
-The speed curriculum (from version 2), with a stability-gated promotion:
-- Robots train on a range of target speeds [0, v_max]; half are held near v_max (the frontier),
-  and targets change mid-episode (k1_speed_env.SpeedCurriculumCommand).
-- v_max is raised by --step only when ALL hold:
-    * at least --min_iters iterations at the current v_max;
-    * over the last --window iterations, frontier robots move at >= --track_ratio of their target;
-    * over the same window, <= --max_fall_rate of finished frontier episodes ended in a fall,
-      with at least --min_episodes finished frontier episodes counted.
-- Training conditions vary: pushes, trunk mass, motor gains (plus friction and command delay).
-Stage checkpoints: stages/stage_NN_vmax<v>_it<iter>.pt (stage 00 = Booster's k1_walk unchanged).
-Events: ramp_events.jsonl ("start", "actor_unfrozen", "target_hit", "stalled", "finished").
+Outputs, in <log_root>/<date>_<run_name>/:
+- stages/stage_NN_vmax<v>_it<iter>.pt, one per promoted level (stage 00 = Booster's k1_walk unchanged);
+- model_<iter>.pt every --save_interval iterations, and at the end;
+- ramp_events.jsonl: "start", "actor_unfrozen", "validation_failed", "validation_error", "target_hit",
+  "stopped", "resumed", "finished";
+- params/: the task and PPO settings, the arguments, and the SHA-256 of the code at each launch.
+
+--resume continues a run in its own folder from its latest checkpoint (model_<it>.pt or a stage checkpoint,
+whichever is later), with the optimizer state, and rebuilds the curriculum from ramp_events.jsonl up to that
+iteration. The run's own arguments (params/curriculum_args.json) are used; passing a different value for one of
+them is an error. Iterations after the checkpoint are redone. The tracking window starts empty, so the Isaac gate
+cannot pass for --window iterations, and the adaptive learning rate restarts from its configured value.
 """
 
 import argparse
@@ -50,69 +43,107 @@ from datetime import datetime
 
 from isaaclab.app import AppLauncher
 
-K1_WALK = "/workspace/upstream/booster_deploy/tasks/locomotion/robots/k1/models/k1_walk.pt"
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from curriculum import Rules, State, gate_due, out_of_patience, promote, state_from_events, window_stats  # noqa: E402
+from run_state import code_provenance, latest_checkpoint, merge_resume_args  # noqa: E402
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--run_name", required=True)
-parser.add_argument("--num_envs", type=int, default=4096)
+K1_WALK = "/workspace/upstream/booster_deploy/tasks/locomotion/robots/k1/models/k1_walk.pt"
+# Arguments that define a run. --resume takes them from the run; the others (paths, timeouts, the iteration cap)
+# may change between launches.
+RUN_KEYS = ("seed", "num_envs", "save_interval", "warmup", "start_speed", "step", "min_iters", "window",
+            "track_ratio", "max_fall_rate", "min_episodes", "patience", "checkpoint", "gate_trials",
+            "gate_min_successes", "gate_speed_ratio", "gate_cooldown")
+
+parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+parser.add_argument("--run_name", help="name of a new run (required unless --resume)")
+parser.add_argument("--resume", default=None, help="run folder to continue from its latest checkpoint")
 parser.add_argument("--seed", type=int, default=1)
-parser.add_argument("--max_iterations", type=int, default=20000)
+parser.add_argument("--num_envs", type=int, default=4096)
+parser.add_argument("--max_iterations", type=int, default=20000, help="hard cap; the stopping rule usually ends first")
 parser.add_argument("--save_interval", type=int, default=250)
 parser.add_argument("--warmup", type=int, default=100, help="critic-only iterations before the actor trains")
-parser.add_argument("--start_speed", type=float, default=1.0, help="initial v_max")
-parser.add_argument("--step", type=float, default=0.25)
-parser.add_argument("--min_iters", type=int, default=300)
-parser.add_argument("--window", type=int, default=200)
-parser.add_argument("--track_ratio", type=float, default=0.9)
-parser.add_argument("--max_fall_rate", type=float, default=0.02)
-parser.add_argument("--min_episodes", type=int, default=200)
-parser.add_argument("--stall_iters", type=int, default=3000)
-parser.add_argument("--checkpoint", default=K1_WALK)
+parser.add_argument("--start_speed", type=float, default=1.0, help="first v_max (m/s)")
+parser.add_argument("--step", type=float, default=0.25, help="v_max increase per promotion (m/s)")
+parser.add_argument("--min_iters", type=int, default=300, help="minimum iterations per level")
+parser.add_argument("--window", type=int, default=200, help="iterations the Isaac gate averages over")
+parser.add_argument("--track_ratio", type=float, default=0.9, help="Isaac gate: minimum frontier speed / target")
+parser.add_argument("--max_fall_rate", type=float, default=0.02, help="Isaac gate: maximum frontier fall rate")
+parser.add_argument("--min_episodes", type=int, default=200, help="Isaac gate: minimum finished frontier episodes")
+parser.add_argument("--patience", type=int, default=1000,
+                    help="stop after this many iterations on one level without promotion (recipe note 6)")
+parser.add_argument("--checkpoint", default=K1_WALK, help="Booster's exported k1_walk policy to start from")
 parser.add_argument("--log_root", default="/workspace/runs/k1_run_v3")
-parser.add_argument("--mj_trials", type=int, default=20)
-parser.add_argument("--mj_min_survive", type=int, default=18)
-parser.add_argument("--mj_speed_ratio", type=float, default=0.9)
-parser.add_argument("--mj_cooldown", type=int, default=100)
-parser.add_argument("--mj_timeout", type=int, default=600, help="seconds before a MuJoCo check counts as broken")
-parser.add_argument("--resume", default=None, help="run folder to continue from its latest checkpoint")
-parser.add_argument("--rec_python", default="/workspace/venv_rec/bin/python")
+parser.add_argument("--gate_trials", type=int, default=20)
+parser.add_argument("--gate_min_successes", type=int, default=18)
+parser.add_argument("--gate_speed_ratio", type=float, default=0.9)
+parser.add_argument("--gate_cooldown", type=int, default=100, help="minimum iterations between MuJoCo checks")
+parser.add_argument("--gate_timeout", type=int, default=600, help="seconds before a MuJoCo check counts as broken")
+parser.add_argument("--rec_python", default="/workspace/venv_rec/bin/python", help="Python of the MuJoCo player env")
 parser.add_argument("--deploy_dir", default="/workspace/upstream/booster_deploy")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+if args.gate_min_successes > args.gate_trials:
+    parser.error(f"--gate_min_successes {args.gate_min_successes} > --gate_trials {args.gate_trials}: no level could pass")
+
+# Check the run folder and arguments before starting Isaac Sim, which takes a while.
+stamp = f"{datetime.now():%Y-%m-%d_%H-%M-%S}"
+if args.resume:
+    log_dir = os.path.abspath(args.resume)
+    try:
+        with open(os.path.join(log_dir, "params", "curriculum_args.json")) as f:
+            saved_args = json.load(f)
+        args = argparse.Namespace(**merge_resume_args(saved_args, vars(args), vars(parser.parse_args([])), RUN_KEYS))
+        resume_ckpt, resume_it = latest_checkpoint(log_dir)
+        with open(os.path.join(log_dir, "ramp_events.jsonl")) as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        resume_state = state_from_events(events, Rules.from_args(args), resume_it)
+    except (OSError, ValueError) as e:
+        sys.exit(f"--resume {args.resume}: {e}")
+elif not args.run_name:
+    parser.error("--run_name is required for a new run")
+else:
+    log_dir = os.path.join(args.log_root, f"{stamp}_{args.run_name}")
+    if not os.path.isfile(args.checkpoint):
+        sys.exit(f"--checkpoint {args.checkpoint} not found (run scripts/launch/runpod/setup_golden_env.sh first)")
+if not os.path.isfile(args.rec_python):
+    sys.exit(f"--rec_python {args.rec_python} not found (run scripts/launch/runpod/setup_recorder_env.sh first)")
+
 args.headless = True
 app = AppLauncher(args).app
 
 import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
 from isaaclab.utils.io import dump_yaml  # noqa: E402
-from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper  # noqa: E402
+from isaaclab_rl.rsl_rl import RslRlSymmetryCfg, RslRlVecEnvWrapper  # noqa: E402
 from rsl_rl.runners import OnPolicyRunner  # noqa: E402
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
 import export_stage  # noqa: E402
 import k1_speed_env as K  # noqa: E402
-from isaaclab_rl.rsl_rl import RslRlSymmetryCfg  # noqa: E402
-from run_state import code_provenance, curriculum_state, latest_checkpoint  # noqa: E402
+from criteria import stage_criteria  # noqa: E402
+
+
+class StopTraining(Exception):
+    """Raised from the runner's log() to end learn() early (the stopping rule)."""
+
+
+def rounded(stats: dict) -> dict:
+    return {k: round(v, 4) if isinstance(v, float) else v for k, v in stats.items()}
 
 
 class CurriculumRunner(OnPolicyRunner):
-    """RSL-RL runner plus critic warm-up and the stability-gated v_max curriculum."""
+    """RSL-RL runner plus critic warm-up, the gated v_max curriculum and the stopping rule (curriculum.py)."""
 
-    def setup_curriculum(self, a, state: dict | None = None) -> None:
-        state = state or {"stage": 0, "v_max": a.start_speed, "level_start": a.warmup, "last_mj_try": None,
-                          "stall_logged": False}
+    def setup_curriculum(self, a: argparse.Namespace, state: State, lr_after_warmup: float) -> None:
         self.a = a
+        self.rules = Rules.from_args(a)
+        self.state = state
+        self.lr_after_warmup = lr_after_warmup
         self.cmd = self.env.unwrapped.command_manager.get_term("base_velocity")
-        self.cmd.set_v_max(state["v_max"])
-        self.win = deque(maxlen=a.window)
-        self.stage = state["stage"]
-        self.level_start = state["level_start"]
-        self.stall_logged = state["stall_logged"]
-        if state["last_mj_try"] is not None:
-            self.last_mj_try = state["last_mj_try"]
+        self.cmd.set_v_max(state.v_max)
+        self.win = deque(maxlen=self.rules.window)
         self.t0 = time.time()
-        self._set_actor_frozen(self.current_learning_iteration < a.warmup)
+        self._set_actor_frozen(self.current_learning_iteration < self.rules.warmup)
 
     def event(self, kind: str, **fields) -> None:
         rec = {"event": kind, "wall_s": round(time.time() - self.t0, 1), "timesteps": getattr(self, "tot_timesteps", 0), **fields}
@@ -131,156 +162,136 @@ class CurriculumRunner(OnPolicyRunner):
             self.alg.schedule = "fixed"
         else:
             self.alg.schedule = "adaptive"
-            self.alg.learning_rate = self.a.lr_after_warmup
+            self.alg.learning_rate = self.lr_after_warmup
             for group in self.alg.optimizer.param_groups:
                 group["lr"] = self.alg.learning_rate
 
     def mujoco_check(self, it: int) -> dict:
-        """Export the current actor and run eval_mujoco.py (perturbed trials, seeds 0-19) at v_max.
+        """Export the current actor and score it in booster_deploy's MuJoCo player (seeds 0-19) at v_max.
 
         Never raises: a broken check returns {"error": ...} so training continues.
         """
+        v_max = self.state.v_max
         cdir = os.path.join(self.log_dir, "candidates")
         os.makedirs(cdir, exist_ok=True)
-        ckpt = os.path.join(cdir, f"cand_vmax{self.cmd.v_max:.2f}_it{it}.pt")
-        log_path = ckpt.replace(".pt", "_eval.log")
+        ckpt = os.path.join(cdir, f"cand_vmax{v_max:.2f}_it{it}.pt")
+        stem = os.path.splitext(ckpt)[0]
+        result_path, log_path = f"{stem}_eval.json", f"{stem}_eval.log"
         try:
             self.save(ckpt)
             policy = export_stage.export(ckpt, cdir)
             cmd = [self.a.rec_python, os.path.join(HERE, "eval_mujoco.py"), "--checkpoint", policy,
-                   "--speed", f"{self.cmd.v_max:.2f}", "--trials", str(self.a.mj_trials), "--seed0", "0",
-                   "--damping_profile", "v3"]
+                   "--speed", f"{v_max:.2f}", "--trials", str(self.a.gate_trials), "--seed0", "0",
+                   "--damping_profile", "v3", "--out", result_path]
             env = dict(os.environ, MUJOCO_GL="egl", PYTHONWARNINGS="ignore")
             p = subprocess.run(cmd, cwd=self.a.deploy_dir, env=env, capture_output=True, text=True,
-                               timeout=self.a.mj_timeout)
+                               timeout=self.a.gate_timeout)
             with open(log_path, "w") as f:
-                f.write(p.stderr)
+                f.write(p.stdout + p.stderr)
             if p.returncode != 0:
                 raise RuntimeError(f"eval_mujoco.py exited with {p.returncode}")
-            out = p.stdout
-            r = json.loads(out if out.startswith("{") else out[out.index("\n{") + 1:])
+            with open(result_path) as f:
+                per_trial = json.load(f)["per_trial"]
+            c = stage_criteria(per_trial, v_max, speed_ratio=self.a.gate_speed_ratio,
+                               min_success=self.a.gate_min_successes)
         except Exception as e:  # noqa: BLE001  (the gate must never take training down)
             return {"error": f"{type(e).__name__}: {e}"[:300], "candidate": os.path.basename(ckpt), "log": log_path}
-        r["passed"] = (r["survived"] >= self.a.mj_min_survive and r["mean_speed_survivors_mps"] is not None
-                       and r["mean_speed_survivors_mps"] >= self.a.mj_speed_ratio * self.cmd.v_max)
-        r["candidate"] = os.path.basename(ckpt)
-        return r
-
-    def _window_stats(self) -> dict:
-        s = {k: sum(w[k] for w in self.win) for k in ("ratio_sum", "ratio_n", "f_falls", "f_done", "a_falls", "a_done")}
-        return {
-            "frontier_tracking": s["ratio_sum"] / s["ratio_n"] if s["ratio_n"] else 0.0,
-            "frontier_fall_rate": s["f_falls"] / s["f_done"] if s["f_done"] else 1.0,
-            "frontier_episodes": int(s["f_done"]),
-            "overall_fall_rate": s["a_falls"] / s["a_done"] if s["a_done"] else 1.0,
-        }
+        return {"passed": c["passes"], "mj_successes": c["successes"], "mj_survived": c["survived"],
+                "mj_trials": c["trials"], "mj_median_speed": c["median_speed_survivors_mps"],
+                "mj_gait": c["gait_survivors_mean"], "candidate": os.path.basename(ckpt)}
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
         super().log(locs, width, pad)
         it = locs["it"]
         self.win.append(self.cmd.pop_stats())
-        st = self._window_stats()
-        self.writer.add_scalar("Curriculum/v_max", self.cmd.v_max, it)
-        self.writer.add_scalar("Curriculum/stage", self.stage, it)
+        st = window_stats(self.win)
+        self.writer.add_scalar("Curriculum/v_max", self.state.v_max, it)
+        self.writer.add_scalar("Curriculum/stage", self.state.stage, it)
         for k in ("frontier_tracking", "frontier_fall_rate", "overall_fall_rate"):
             self.writer.add_scalar(f"Curriculum/{k}", st[k], it)
-        if it + 1 == self.a.warmup:
+        if it + 1 == self.rules.warmup:
             self._set_actor_frozen(False)
             self.event("actor_unfrozen", iteration=it)
-        if it < self.a.warmup:
+        if it < self.rules.warmup:
             return
-        on_level = it - self.level_start
-        ready = (
-            on_level >= self.a.min_iters
-            and len(self.win) == self.win.maxlen
-            and st["frontier_episodes"] >= self.a.min_episodes
-            and st["frontier_tracking"] >= self.a.track_ratio
-            and st["frontier_fall_rate"] <= self.a.max_fall_rate
-        )
-        if ready and it - getattr(self, "last_mj_try", -10**9) < self.a.mj_cooldown:
-            ready = False
-        mj = None
-        if ready:
-            self.last_mj_try = it
+        if gate_due(self.state, self.rules, it, st, len(self.win)):
+            self.state.last_gate_try = it
             mj = self.mujoco_check(it)
             if "error" in mj:
-                self.event("validation_error", target=self.cmd.v_max, iteration=it, **mj)
+                self.event("validation_error", target=self.state.v_max, iteration=it, **mj)
+            elif not mj.pop("passed"):
+                self.event("validation_failed", target=self.state.v_max, iteration=it, **mj, **rounded(st))
+            else:
+                name = f"stage_{self.state.stage + 1:02d}_vmax{self.state.v_max:.2f}_it{it}.pt"
+                self.save(os.path.join(self.log_dir, "stages", name))
+                self.event("target_hit", stage=self.state.stage + 1, target=self.state.v_max, iteration=it, **mj,
+                           iterations_on_target=it - self.state.level_start, checkpoint=name, **rounded(st))
+                self.state = promote(self.state, self.rules, it)
+                self.cmd.set_v_max(self.state.v_max)
+                self.win.clear()
                 return
-            mj_brief = {"mj_survived": mj["survived"], "mj_trials": mj["trials"], "mj_speed": mj["mean_speed_survivors_mps"],
-                        "mj_gait": mj["gait_survivors_mean"], "candidate": mj["candidate"]}
-            if not mj["passed"]:
-                self.event("validation_failed", target=self.cmd.v_max, iteration=it, **mj_brief,
-                           **{k: round(v, 4) if isinstance(v, float) else v for k, v in st.items()})
-                ready = False
-        if ready:
-            self.stage += 1
-            name = f"stage_{self.stage:02d}_vmax{self.cmd.v_max:.2f}_it{it}.pt"
-            self.save(os.path.join(self.log_dir, "stages", name))
-            self.event("target_hit", stage=self.stage, target=self.cmd.v_max, iteration=it, **mj_brief, iterations_on_target=on_level, checkpoint=name,
-                       **{k: round(v, 4) if isinstance(v, float) else v for k, v in st.items()})
-            self.cmd.set_v_max(self.cmd.v_max + self.a.step)
-            self.win.clear()
-            self.level_start = it
-            self.stall_logged = False
-        elif not self.stall_logged and on_level >= self.a.stall_iters:
-            self.stall_logged = True
-            self.event("stalled", target=self.cmd.v_max, iteration=it, **{k: round(v, 4) if isinstance(v, float) else v for k, v in st.items()})
+        if out_of_patience(self.state, self.rules, it):
+            self.event("stopped", reason="no promotion within --patience iterations (recipe note 6)",
+                       target=self.state.v_max, iteration=it, level_start=self.state.level_start, **rounded(st))
+            raise StopTraining
 
 
-env_cfg = K.make_env_cfg_v3(args.num_envs)
-env_cfg.seed = args.seed
-agent_cfg = K.K1SpeedPPOCfg()
-agent_cfg.seed = args.seed
-agent_cfg.max_iterations = args.max_iterations
-agent_cfg.save_interval = args.save_interval
-agent_cfg.experiment_name = "k1_run_v3"
-agent_cfg.algorithm.symmetry_cfg = RslRlSymmetryCfg(use_data_augmentation=True, use_mirror_loss=False,
-                                                    data_augmentation_func="k1_symmetry:compute_symmetric_states")
-agent_cfg.run_name = args.run_name
-args.lr_after_warmup = agent_cfg.algorithm.learning_rate
+def main() -> None:
+    env_cfg = K.make_env_cfg(args.num_envs)
+    env_cfg.seed = args.seed
+    agent_cfg = K.K1SpeedPPOCfg()
+    agent_cfg.seed = args.seed
+    agent_cfg.max_iterations = args.max_iterations
+    agent_cfg.save_interval = args.save_interval
+    agent_cfg.algorithm.symmetry_cfg = RslRlSymmetryCfg(use_data_augmentation=True, use_mirror_loss=False,
+                                                        data_augmentation_func="k1_symmetry:compute_symmetric_states")
+    agent_cfg.run_name = args.run_name or os.path.basename(log_dir)
 
-stamp = f"{datetime.now():%Y-%m-%d_%H-%M-%S}"
-if args.resume:
-    log_dir = os.path.abspath(args.resume)
-    resume_ckpt, resume_it = latest_checkpoint(log_dir)
-    with open(os.path.join(log_dir, "ramp_events.jsonl")) as f:
-        resume_state = curriculum_state([json.loads(line) for line in f if line.strip()], args, resume_it)
-    with open(os.path.join(log_dir, "params", f"resume_{stamp}.json"), "w") as f:
-        json.dump({"args": vars(args), "checkpoint": resume_ckpt, "iteration": resume_it, "state": resume_state}, f,
-                  indent=2, default=str)
-else:
-    log_dir = os.path.join(args.log_root, f"{stamp}_{args.run_name}")
-    os.makedirs(os.path.join(log_dir, "stages"), exist_ok=True)
-    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-    with open(os.path.join(log_dir, "params", "curriculum_args.json"), "w") as f:
-        json.dump(vars(args), f, indent=2, default=str)
-with open(os.path.join(log_dir, "params", f"code_{stamp}.json"), "w") as f:
-    json.dump(code_provenance(), f, indent=2)
+    if args.resume:
+        with open(os.path.join(log_dir, "params", f"resume_{stamp}.json"), "w") as f:
+            json.dump({"args": vars(args), "checkpoint": resume_ckpt, "iteration": resume_it,
+                       "state": vars(resume_state)}, f, indent=2, default=str)
+    else:
+        os.makedirs(os.path.join(log_dir, "stages"), exist_ok=True)
+        dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+        dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+        with open(os.path.join(log_dir, "params", "curriculum_args.json"), "w") as f:
+            json.dump(vars(args), f, indent=2, default=str)
+    with open(os.path.join(log_dir, "params", f"code_{stamp}.json"), "w") as f:
+        json.dump(code_provenance(), f, indent=2)
 
-env = RslRlVecEnvWrapper(gym.make("Bronco-K1-SpeedRamp-v0", cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
-runner = CurriculumRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    env = RslRlVecEnvWrapper(gym.make(K.TASK_ID, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
+    runner = CurriculumRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    lr = agent_cfg.algorithm.learning_rate
 
-if args.resume:
-    runner.load(resume_ckpt)  # policy, optimizer, iteration
-    runner._prepare_logging_writer()  # save() needs the writer, which learn() would otherwise create
-    runner.setup_curriculum(args, resume_state)
-    runner.event("resumed", checkpoint=os.path.relpath(resume_ckpt, log_dir), iteration=resume_it, **resume_state)
-else:
-    k1_walk = torch.jit.load(args.checkpoint, map_location=agent_cfg.device)
-    actor_sd = {k.removeprefix("actor."): v for k, v in k1_walk.state_dict().items() if k.startswith("actor.")}
-    runner.alg.policy.actor.load_state_dict(actor_sd)
-    runner._prepare_logging_writer()  # save() needs the writer, which learn() would otherwise create
-    runner.save(os.path.join(log_dir, "stages", "stage_00_k1_walk_baseline.pt"))
-    runner.setup_curriculum(args)
-    runner.event("start", version=3, seed=args.seed, start_speed=args.start_speed, step=args.step,
-                 min_iters=args.min_iters, window=args.window, track_ratio=args.track_ratio,
-                 max_fall_rate=args.max_fall_rate, min_episodes=args.min_episodes, warmup=args.warmup,
-                 source=args.checkpoint, mj_trials=args.mj_trials, mj_min_survive=args.mj_min_survive,
-                 mj_speed_ratio=args.mj_speed_ratio)
+    if args.resume:
+        runner.load(resume_ckpt)  # policy, optimizer, iteration
+        runner._prepare_logging_writer()  # save() needs the writer, which learn() would otherwise create
+        runner.setup_curriculum(args, resume_state, lr)
+        runner.event("resumed", checkpoint=os.path.relpath(resume_ckpt, log_dir), iteration=resume_it,
+                     **vars(resume_state))
+    else:
+        k1_walk = torch.jit.load(args.checkpoint, map_location=agent_cfg.device)
+        actor_sd = {k.removeprefix("actor."): v for k, v in k1_walk.state_dict().items() if k.startswith("actor.")}
+        runner.alg.policy.actor.load_state_dict(actor_sd)
+        runner._prepare_logging_writer()  # save() needs the writer, which learn() would otherwise create
+        runner.save(os.path.join(log_dir, "stages", "stage_00_k1_walk_baseline.pt"))
+        state = State.fresh(Rules.from_args(args))
+        runner.setup_curriculum(args, state, lr)
+        runner.event("start", version=3, **{k: getattr(args, k) for k in RUN_KEYS})
 
-runner.learn(num_learning_iterations=max(0, agent_cfg.max_iterations - runner.current_learning_iteration),
-             init_at_random_ep_len=True)
-runner.event("finished", final_v_max=runner.cmd.v_max, stages=runner.stage)
-env.close()
-app.close()
+    try:
+        runner.learn(num_learning_iterations=max(0, agent_cfg.max_iterations - runner.current_learning_iteration),
+                     init_at_random_ep_len=True)
+    except StopTraining:
+        runner.save(os.path.join(log_dir, f"model_{runner.current_learning_iteration}.pt"))
+    runner.event("finished", iteration=runner.current_learning_iteration, final_v_max=runner.state.v_max,
+                 stages=runner.state.stage)
+    if runner.writer is not None:
+        runner.writer.flush()  # Isaac Sim can exit before buffered TensorBoard events are written
+    env.close()
+
+
+if __name__ == "__main__":
+    main()
+    app.close()

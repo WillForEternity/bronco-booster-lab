@@ -1,5 +1,7 @@
 """Left-right mirror of K1's k1_walk observations and actions, for symmetry-augmented PPO.
 
+Runs on: GPU host (RSL-RL imports it by name: "k1_symmetry:compute_symmetric_states"); laptop for the unit tests.
+
 Method: Mittal et al., "Symmetry Considerations for Learning Task Symmetric Robot Policies" (ICRA
 2024), as implemented by RSL-RL's symmetry module (`symmetry_cfg.data_augmentation_func`).
 
@@ -18,24 +20,13 @@ from __future__ import annotations
 
 import torch
 
-POLICY_JOINTS = [
-    "aaleft_shoulder_pitch_joint", "aaright_shoulder_pitch_joint",
-    "left_hip_pitch_joint", "right_hip_pitch_joint",
-    "left_shoulder_roll_joint", "right_shoulder_roll_joint",
-    "left_hip_roll_joint", "right_hip_roll_joint",
-    "left_elbow_pitch_joint", "right_elbow_pitch_joint",
-    "left_hip_yaw_joint", "right_hip_yaw_joint",
-    "left_elbow_yaw_joint", "right_elbow_yaw_joint",
-    "left_knee_pitch_joint", "right_knee_pitch_joint",
-    "left_ankle_pitch_joint", "right_ankle_pitch_joint",
-    "left_ankle_roll_joint", "right_ankle_roll_joint",
-]
+from k1_conventions import ELBOW_FIX_JOINT, ELBOW_FIX_OFFSET, FRAME, HISTORY, OBS_DIM, POLICY_JOINTS
+
 N = len(POLICY_JOINTS)
 PERM = [i + 1 if i % 2 == 0 else i - 1 for i in range(N)]  # pairs are stored left, right
 SIGN = [-1.0 if ("roll" in j or "yaw" in j) else 1.0 for j in POLICY_JOINTS]
-L_ELBOW, R_ELBOW = POLICY_JOINTS.index("left_elbow_pitch_joint"), POLICY_JOINTS.index("right_elbow_pitch_joint")
-ELBOW_SHIFT = 0.2
-HISTORY, FRAME = 10, 9 + 3 * N  # 69
+R_ELBOW = POLICY_JOINTS.index(ELBOW_FIX_JOINT)
+L_ELBOW = POLICY_JOINTS.index(ELBOW_FIX_JOINT.replace("right", "left"))
 
 
 def mirror_joints(x: torch.Tensor) -> torch.Tensor:
@@ -45,8 +36,8 @@ def mirror_joints(x: torch.Tensor) -> torch.Tensor:
 
 def mirror_actions(a: torch.Tensor) -> torch.Tensor:
     m = mirror_joints(a)
-    m[..., L_ELBOW] -= ELBOW_SHIFT
-    m[..., R_ELBOW] += ELBOW_SHIFT
+    m[..., L_ELBOW] -= ELBOW_FIX_OFFSET
+    m[..., R_ELBOW] += ELBOW_FIX_OFFSET
     return m
 
 
@@ -71,8 +62,8 @@ def mirror_history(h: torch.Tensor) -> torch.Tensor:
 def mirror_critic(c: torch.Tensor) -> torch.Tensor:
     """c[..., 693] = history (690) + base linear velocity in the body frame (3)."""
     out = torch.empty_like(c)
-    out[..., :HISTORY * FRAME] = mirror_history(c[..., :HISTORY * FRAME])
-    out[..., HISTORY * FRAME:] = c[..., HISTORY * FRAME:] * c.new_tensor([1.0, -1.0, 1.0])
+    out[..., :OBS_DIM] = mirror_history(c[..., :OBS_DIM])
+    out[..., OBS_DIM:] = c[..., OBS_DIM:] * c.new_tensor([1.0, -1.0, 1.0])
     return out
 
 

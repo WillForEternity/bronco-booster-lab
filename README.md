@@ -72,29 +72,35 @@ uv run mjpython ../bronco-booster-lab/demo/speed_ramp/play_speed.py --speed 1.0
 
 Training needs Isaac Sim, which needs an NVIDIA RTX GPU on Linux or Windows, so it runs on a rented GPU, not on a laptop. [demo/speed_ramp/README.md](demo/speed_ramp/README.md) has the commands, from a fresh GPU host to a trained policy. [demo/speed_ramp/RECIPE.md](demo/speed_ramp/RECIPE.md) explains the recipe, and [Docs/runbooks/golden_env.md](Docs/runbooks/golden_env.md) describes the GPU environment.
 
-In short, `train_v3.py` starts from `k1_walk` and raises the target speed in 0.25 m/s stages. A stage is promoted only when the policy tracks it in Isaac Lab **and** survives at least 18 of 20 perturbed trials in Booster's MuJoCo player. Our runs (October 7–8, 2026) passed the 2.0 m/s stage in both seeds, with a flight phase, which makes it a run rather than a fast walk. The held-out final test runs after training stops.
+In short, `train_v3.py` starts from `k1_walk` and raises the target speed in 0.25 m/s stages. A stage is promoted only when the policy tracks it in Isaac Lab **and**, in Booster's MuJoCo player, at least 18 of 20 perturbed trials each survive 10 s at 90% or more of the target speed. That is the same rule the held-out final test applies after training stops, on trial seeds training never sees.
+
+Our two seeds (October 7–8, 2026) reached 2.0 m/s. In the final test, their 2.0 m/s stages succeeded in 20 of 20 and 19 of 20 trials, with both feet off the ground about 26% of the time: a run, not a fast walk. Those runs used an earlier version of the training gate; [RECIPE.md](demo/speed_ramp/RECIPE.md#changes-since-the-october-78-runs) lists what changed since.
 
 ## 4. Play a fine-tuned policy
 
 ```bash
 # Runs on: laptop, in booster_deploy/
 uv run mjpython ../bronco-booster-lab/demo/speed_ramp/play_speed.py \
-    --checkpoint /absolute/path/to/policy.pt --speed 2.0 --damping_profile v3
+    --checkpoint path/to/policy.pt --speed 2.0 --damping_profile v3
 ```
 
-Use `python` instead of `mjpython` on Windows and Linux. `--damping_profile v3` matters: fine-tuned policies were trained with it ([RECIPE.md](demo/speed_ramp/RECIPE.md), note 2). Checkpoints are not stored in Git. Train your own, or ask a club lead for ours. [demo/speed_ramp/README.md](demo/speed_ramp/README.md#play-a-policy-laptop) shows how to export a training checkpoint into a playable `policy.pt`.
+Use `python` instead of `mjpython` on Windows and Linux. `--damping_profile v3` matters: fine-tuned policies were trained with it ([RECIPE.md](demo/speed_ramp/RECIPE.md), note 2). Keep `--speed` at or below the speed the policy was trained to.
+
+Checkpoints are not stored in Git. Train your own, or ask a club lead for ours. A policy file is TorchScript, which is code, so only play policies from people you trust. [demo/speed_ramp/README.md](demo/speed_ramp/README.md#play-a-policy-laptop) shows how to export a training checkpoint into a playable `policy.pt`.
 
 ## Working in this repository
 
 - **Claude Code** reads [AGENTS.md](AGENTS.md) (through `CLAUDE.md`) for this repository's rules and commands. Install it with `curl -fsSL https://claude.ai/install.sh | bash` (macOS and Linux) or `irm https://claude.ai/install.ps1 | iex` (Windows PowerShell), then run `claude` in this folder. It needs a Claude account.
-- **Lint and tests** run on a laptop, in a separate environment in this folder:
+- **Checks and tests** run on a laptop, in a separate environment in this folder. GitHub runs the same checks and unit tests on every push and pull request ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
 
   ```bash
+  # Runs on: laptop, in bronco-booster-lab/
   uv venv --python 3.11
   uv pip install --python .venv/bin/python -r requirements-dev.txt
-  .venv/bin/ruff check .
-  .venv/bin/pytest
-  .venv/bin/pre-commit install    # once: runs the checks at every commit
+  .venv/bin/pre-commit install             # once: runs the checks at every commit
+  .venv/bin/pre-commit run --all-files     # lint (ruff, shellcheck) and file checks
+  .venv/bin/pytest                         # unit tests; no Isaac Lab or Booster code needed
+  BOOSTER_DEPLOY=../booster_deploy .venv/bin/pytest tests/integration   # against Booster's real MuJoCo player
   ```
 
 ## Tested versions

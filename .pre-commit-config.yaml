@@ -1,4 +1,4 @@
-# Checks that run at every `git commit`. Runs on: laptop.
+# Checks that run at every `git commit`, and in CI (.github/workflows/ci.yml). Runs on: laptop.
 #   uv pip install --python .venv/bin/python -r requirements-dev.txt
 #   .venv/bin/pre-commit install          # once per clone
 #   .venv/bin/pre-commit run --all-files  # by hand
@@ -7,6 +7,10 @@ repos:
     rev: v0.16.10  # keep equal to ruff in requirements-dev.txt
     hooks:
       - id: ruff-check
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
@@ -15,6 +19,8 @@ repos:
       - id: trailing-whitespace
       - id: check-added-large-files
         args: [--maxkb=500]
+      - id: check-executables-have-shebangs
+      - id: check-merge-conflict
       - id: detect-private-key
   - repo: local
     hooks:

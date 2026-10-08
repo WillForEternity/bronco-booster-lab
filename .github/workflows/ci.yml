@@ -1,0 +1,42 @@
+# Lint and unit tests on every push and pull request. Runs on: GitHub's Linux runners (no GPU, no Booster repos).
+# The same checks run locally: .venv/bin/pre-commit run --all-files && .venv/bin/pytest
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install dev tools
+        # CPU-only PyTorch: the tests need no GPU, and the default Linux wheel pulls in gigabytes of CUDA libraries.
+        run: |
+          uv venv --python 3.11
+          uv pip install -r requirements-dev.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+
+      - name: Pre-commit hooks (ruff, shellcheck, file checks, no models or videos)
+        run: .venv/bin/pre-commit run --all-files --show-diff-on-failure
+
+      - name: Unit tests
+        run: .venv/bin/pytest

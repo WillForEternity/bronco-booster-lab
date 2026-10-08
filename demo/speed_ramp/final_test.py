@@ -1,4 +1,4 @@
-"""Version-3 final test (RECIPE.md, notes 3-7). Never used for training decisions.
+"""The final test of the version-3 recipe (RECIPE.md, notes 3-7). Never used for training decisions.
 
 Runs on: GPU host (recorder environment, /workspace/venv_rec) or laptop (booster_deploy's environment),
 from booster_deploy's repository root, after training has stopped:
@@ -6,16 +6,15 @@ from booster_deploy's repository root, after training has stopped:
 
 For every promoted stage (stages/stage_NN_vmax<v>_it<i>.pt, NN >= 1) of every run under --runs:
 - export it to booster_deploy's format and play 20 perturbed trials (eval_mujoco.py) at the stage's
-  v_max, with trial seeds 1000-1019 (the validation gate uses 0-19) and damping profile v3;
-- per trial (recipe note 3): success = survives 10 s AND its own forward speed >= 0.9 x command;
-  speed error = (forward speed - command) / command; EPTE-SP (note 5);
-- per stage: passes with >= 18/20 successes. Also reported: median speed error, flagged "overshoots"
-  above +10% (note 4); EPTE-SP median and worst; survivor means of the gait measures; and
-  "symmetric" (mean stance asymmetry <= 10%, version 3 success definition).
-Result per run: the highest promoted stage that passes. Recipe result: the lower of the runs' results
-(note 6); the higher one is reported, not claimed.
+  v_max, with trial seeds 1000-1019 (the training gate uses 0-19) and damping profile v3;
+- score it with the rule the training gate also uses (criteria.py; note 3): a trial succeeds if it survives
+  10 s AND its own forward speed is >= 0.9 x command; a stage passes with >= 18/20 successes.
+  Also reported: median speed error and an "overshoots" flag above +10% (note 4); EPTE-SP median and worst
+  (note 5); survivor means of the gait measures; and "symmetric" (mean stance asymmetry <= 10%).
+Result per run: the highest promoted stage that passes. Recipe result: the lowest of the runs' results
+(note 6); a higher one is reported, not claimed.
 
-Outputs: <out>/<run>/<stage>.json (all trials and provenance), <out>/summary.json, <out>/summary.md.
+Outputs: <out>/<run>/stage_NN.json (all trials and provenance), <out>/summary.json, <out>/summary.md.
 A stage whose JSON already exists is not re-run unless --force is given.
 """
 
@@ -23,95 +22,18 @@ from __future__ import annotations
 
 import argparse
 import glob
-import hashlib
 import json
 import os
 import platform
-import re
-import statistics
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+from criteria import MIN_SUCCESSES, SPEED_RATIO, recipe_result, run_result, stage_criteria
+from run_state import STAGE_RE, sha256_file
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-STAGE_RE = re.compile(r"stage_(\d+)_vmax(\d+\.\d+)_it(\d+)\.pt$")
-GAIT_KEYS = ("flight_fraction", "duty_factor", "stance_asymmetry", "cost_of_transport", "leg_torque_saturation",
-             "trunk_pitch_rms_deg", "trunk_roll_rms_deg")
-
-
-# --- Criteria (pure functions; tested in tests/demo/test_final_test.py) --------------------------------------
-
-
-def trial_speed(t: dict, metric: str) -> float | None:
-    return t["forward_speed_mps"] if metric == "forward" else t["steady_speed_mps"]
-
-
-def stage_criteria(per_trial: list[dict], command: float, *, metric: str = "forward", speed_ratio: float = 0.9,
-                   min_success: int = 18, overshoot: float = 0.10, max_asymmetry: float = 0.10) -> dict:
-    """Amendments 3-5 applied to one stage's trials at one commanded speed."""
-    success, errors, epte = [], [], []
-    for t in per_trial:
-        v = trial_speed(t, metric)
-        ok = bool(t["survived"] and v is not None and v >= speed_ratio * command)
-        success.append(ok)
-        if t["survived"] and v is not None:
-            errors.append((v - command) / command)
-        if t.get("epte_sp") is not None:
-            epte.append(t["epte_sp"])
-    survivors = [t for t in per_trial if t["survived"]]
-    gait = {}
-    for k in GAIT_KEYS:
-        vals = [t["gait"][k] for t in survivors if t.get("gait") and t["gait"].get(k) is not None]
-        gait[k] = round(statistics.fmean(vals), 4) if vals else None
-    median_err = statistics.median(errors) if errors else None
-    asym = gait["stance_asymmetry"]
-    speeds = [trial_speed(t, metric) for t in survivors if trial_speed(t, metric) is not None]
-    return {
-        "command_mps": command,
-        "speed_metric": metric,
-        "trials": len(per_trial),
-        "survived": len(survivors),
-        "successes": sum(success),
-        "passes": sum(success) >= min_success,
-        "median_speed_survivors_mps": round(statistics.median(speeds), 3) if speeds else None,
-        "median_speed_error": round(median_err, 4) if median_err is not None else None,
-        "overshoots": median_err is not None and median_err > overshoot,
-        "epte_sp_median": round(statistics.median(epte), 4) if epte else None,
-        "epte_sp_worst": round(max(epte), 4) if epte else None,
-        "symmetric": asym is not None and asym <= max_asymmetry,
-        "gait_survivors_mean": gait,
-        "per_trial_success": success,
-    }
-
-
-def run_result(stages: list[dict]) -> dict | None:
-    """Highest promoted stage that passes (stages: dicts with 'stage', 'v_max', 'criteria')."""
-    passing = [s for s in stages if s["criteria"]["passes"]]
-    if not passing:
-        return None
-    best = max(passing, key=lambda s: s["stage"])
-    return {"stage": best["stage"], "v_max": best["v_max"], "symmetric": best["criteria"]["symmetric"],
-            "checkpoint": best["checkpoint"]}
-
-
-def recipe_result(results: dict[str, dict | None]) -> dict:
-    """Amendment 6: the recipe's result is the lower of the runs' results."""
-    speeds = {run: (r["v_max"] if r else None) for run, r in results.items()}
-    if not speeds or any(v is None for v in speeds.values()):
-        return {"v_max": None, "per_run": speeds, "note": "at least one run has no passing stage"}
-    low = min(speeds, key=speeds.get)
-    return {"v_max": speeds[low], "limited_by": low, "per_run": speeds}
-
-
-# --- Running ---------------------------------------------------------------------------------------------------
-
-
-def sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+FINAL_SEED0 = 1000  # seeds 0-19 belong to the training gate
 
 
 def find_stages(runs_dir: str) -> list[dict]:
@@ -125,14 +47,14 @@ def find_stages(runs_dir: str) -> list[dict]:
     return out
 
 
-def test_stage(job: dict) -> dict:
+def score_stage(job: dict) -> dict:
     """Export, evaluate and score one stage. Runs in a worker process (cwd = booster_deploy's root)."""
-    sys.path.insert(0, HERE)
-    import eval_mujoco  # noqa: PLC0415  (imports booster_deploy; needs booster_deploy's root as cwd)
-    import export_stage  # noqa: PLC0415
-    import mujoco  # noqa: PLC0415
-    import numpy  # noqa: PLC0415
-    import torch  # noqa: PLC0415
+    # Imported here, not at the top: they load booster_deploy and MuJoCo, which only the workers need.
+    import eval_mujoco
+    import export_stage
+    import mujoco
+    import numpy
+    import torch
 
     a = job["args"]
     policy = export_stage.export(job["checkpoint"], os.path.join(a["out"], job["run"], "policies"))
@@ -145,11 +67,12 @@ def test_stage(job: dict) -> dict:
         "criteria": crit,
         "evaluation": r,
         "provenance": {
-            "checkpoint_sha256": sha256(job["checkpoint"]),
+            "checkpoint_sha256": sha256_file(job["checkpoint"]),
             "policy": policy,
-            "policy_sha256": sha256(policy),
-            "final_test_sha256": sha256(os.path.join(HERE, "final_test.py")),
-            "eval_mujoco_sha256": sha256(os.path.join(HERE, "eval_mujoco.py")),
+            "policy_sha256": sha256_file(policy),
+            "code_sha256": {name: sha256_file(os.path.join(HERE, name))
+                            for name in ("final_test.py", "eval_mujoco.py", "criteria.py", "booster_player.py",
+                                         "export_stage.py", "k1_conventions.py", "speed_metrics.py")},
             "versions": {"mujoco": mujoco.__version__, "torch": torch.__version__, "numpy": numpy.__version__,
                          "python": platform.python_version(), "platform": platform.platform()},
             "wall_s": round(time.time() - t0, 1),
@@ -196,7 +119,7 @@ def write_summary(out: str, results: list[dict], args: dict) -> dict:
         lines.append(f"- {run}: " + (f"stage {r['stage']} ({r['v_max']:.2f} m/s), symmetric: "
                                      f"{'yes' if r['symmetric'] else 'no'}" if r else "no stage passes"))
     rec = summary["recipe"]
-    lines.append(f"- Recipe (lower of the runs): {fmt(rec['v_max'])} m/s" + (f", limited by {rec['limited_by']}"
+    lines.append(f"- Recipe (lowest of the runs): {fmt(rec['v_max'])} m/s" + (f", limited by {rec['limited_by']}"
                                                                            if rec.get("limited_by") else ""))
     with open(os.path.join(out, "summary.md"), "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -209,17 +132,19 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--trials", type=int, default=20)
     ap.add_argument("--seconds", type=float, default=10.0)
-    ap.add_argument("--seed0", type=int, default=1000)
-    ap.add_argument("--damping_profile", default="v3")
+    ap.add_argument("--seed0", type=int, default=FINAL_SEED0)
+    ap.add_argument("--damping_profile", default="v3", help="v3 for policies from train_v3.py")
     ap.add_argument("--speed_metric", choices=["forward", "steady"], default="forward",
                     help="trial speed for the success rule (recipe note 7: forward)")
-    ap.add_argument("--speed_ratio", type=float, default=0.9)
-    ap.add_argument("--min_success", type=int, default=18)
+    ap.add_argument("--speed_ratio", type=float, default=SPEED_RATIO)
+    ap.add_argument("--min_success", type=int, default=MIN_SUCCESSES)
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--force", action="store_true", help="re-run stages that already have results")
     a = ap.parse_args()
-    if a.seed0 < 1000:
-        sys.exit("Final-test seeds start at 1000; seeds 0-19 belong to the training gate.")
+    if a.min_success > a.trials:
+        ap.error(f"--min_success {a.min_success} > --trials {a.trials}: no stage could pass")
+    if a.seed0 < FINAL_SEED0:
+        sys.exit(f"Final-test seeds start at {FINAL_SEED0}; seeds 0-19 belong to the training gate.")
     if not os.path.isdir("tasks"):
         sys.exit("Run from booster_deploy's repository root (eval_mujoco imports its tasks package).")
     args = {k: v for k, v in vars(a).items() if k not in ("jobs", "force")}
@@ -240,7 +165,7 @@ def main() -> None:
 
     failed = []
     with ProcessPoolExecutor(max_workers=a.jobs) as pool:
-        futures = {pool.submit(test_stage, job): job for job in todo}
+        futures = {pool.submit(score_stage, job): job for job in todo}
         for fut in as_completed(futures):
             job = futures[fut]
             try:

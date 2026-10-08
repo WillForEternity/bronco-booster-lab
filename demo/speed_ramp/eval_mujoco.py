@@ -1,7 +1,11 @@
-"""Robustness check in booster_deploy's MuJoCo player: N perturbed trials per policy and speed.
+"""Robustness check in booster_deploy's MuJoCo player: N perturbed trials of one policy at one speed.
 
-Runs on: GPU host or laptop (recorder environment), from booster_deploy's repository root:
-    python eval_mujoco.py --checkpoint <policy.pt> --speed 2.5 [--trials 20]
+Runs on: GPU host or laptop, in booster_deploy's environment, from booster_deploy's repository root:
+    python <repo>/demo/speed_ramp/eval_mujoco.py --checkpoint <policy.pt> --speed 2.0 --damping_profile v3 \
+        [--trials 20] [--out result.json]
+
+Prints a summary as JSON; --out also writes the full result, with every trial. Pass/fail rules are in
+criteria.py (used by train_v3.py's gate and final_test.py).
 
 A single deterministic replay can land on either side of a fall (the same policy fell on a Mac
 and survived on Linux), so a policy is judged by the share of perturbed trials it survives.
@@ -11,9 +15,9 @@ Trial k (seed k) adds, to the unchanged k1_walk player:
 A trial survives if booster_deploy's fall detector does not stop the policy within --seconds.
 
 Speeds, per trial, over the steady part (after the first 2 s):
-- steady_speed_mps: straight-line displacement / time (any direction; what the training gate uses);
 - forward_speed_mps: mean velocity along the trunk's heading, the quantity Isaac's training command
-  tracks. Sideways drift and the push do not count toward it.
+  tracks, and the one the pass rule uses (recipe note 7). Sideways drift and the push do not count toward it;
+- steady_speed_mps: straight-line displacement / time, in any direction.
 Energy and leg torque saturation are measured at every physics substep (booster_deploy runs PD at
 2 ms, `decimation` substeps per 20 ms policy step), not once per policy step.
 """
@@ -21,52 +25,22 @@ Energy and leg torque saturation are measured at every physics substep (booster_
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
 import os
-import pkgutil
-import platform
-import sys
 
-if platform.system() == "Linux":
-    os.environ.setdefault("MUJOCO_GL", "egl")  # before mujoco is imported anywhere
+from booster_player import fixed_speed_controller, k1_walk_cfg  # first: sets MUJOCO_GL before mujoco is imported
 
+import mujoco
 import numpy as np
 import torch
 
-sys.path.append(".")
-import tasks as tasks_pkg  # noqa: E402
-
-for _mod in pkgutil.walk_packages(tasks_pkg.__path__, prefix="tasks."):
-    __import__(_mod.name)
-import mujoco  # noqa: E402
-from booster_deploy.controllers.mujoco_controller import MujocoController  # noqa: E402
-from booster_deploy.utils.registry import get_task  # noqa: E402
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from speed_metrics import epte_sp, heading_speed  # noqa: E402
+from criteria import survivor_gait_means
+from k1_conventions import DAMPING_PROFILES
+from speed_metrics import epte_sp, heading_speed
 
 JOINT_NOISE, PUSH_SPEED, PUSH_WINDOW = 0.05, 0.3, (3.0, 7.0)
 SETTLE_S = 2.0  # speed, gait and energy measures start after this
-
-# Joint damping profiles for booster_deploy's MuJoCo player. "v3": only the two arm joints whose explicit PD is
-# unstable at 2 ms in some postures (damping x dt / inertia: elbow pitch 2.69, shoulder pitch 1.94) are lowered,
-# to 0.7 and 1.0 (worst-case ratio ~0.95). Shoulder roll and elbow yaw keep Booster's 2.0.
-DAMPING_PROFILES = {"v3": {"shoulder_pitch": 1.0, "elbow_pitch": 0.7}}
-
-
-def set_damping_profile(cfg, profile: str | None) -> None:
-    """Apply a damping profile to a booster_deploy task config (None keeps Booster's values)."""
-    if not profile:
-        return
-    rules = DAMPING_PROFILES[profile]
-    damping = list(cfg.robot.joint_damping)
-    for i, n in enumerate(cfg.robot.joint_names):
-        for key, kd in rules.items():
-            if key in n:
-                damping[i] = kd
-    cfg.robot.joint_damping = damping
 
 
 class SubstepMeter:
@@ -110,14 +84,8 @@ class SubstepMeter:
 
 def trial(checkpoint: str | None, speed: float, seed: int, seconds: float, damping_profile: str | None = None) -> dict:
     rng = np.random.default_rng(seed)
-    cfg = copy.deepcopy(get_task("k1_walk"))  # the registry object is shared
-    cfg.policy.device = "cpu"
-    set_damping_profile(cfg, damping_profile)
-    if checkpoint:
-        cfg.policy.checkpoint_path = os.path.abspath(checkpoint)
-    ctrl = MujocoController(cfg)
-    ctrl.update_vel_command = lambda: None
-    ctrl.vel_command.lin_vel_x, ctrl.vel_command.lin_vel_y, ctrl.vel_command.ang_vel_yaw = speed, 0.0, 0.0
+    cfg = k1_walk_cfg(checkpoint, damping_profile)
+    ctrl = fixed_speed_controller(cfg, speed)
     d = ctrl.mj_data
     d.qpos[7:] += rng.uniform(-JOINT_NOISE, JOINT_NOISE, size=d.qpos[7:].shape)
     mujoco.mj_forward(ctrl.mj_model, d)
@@ -205,15 +173,10 @@ def evaluate(checkpoint: str | None, speed: float, trials: int = 20, seconds: fl
     ok = [r for r in res if r["survived"]]
     speeds = [r["steady_speed_mps"] for r in ok if r["steady_speed_mps"] is not None]
     fwd = [r["forward_speed_mps"] for r in ok if r["forward_speed_mps"] is not None]
-    gait = {}
-    for key in ("flight_fraction", "duty_factor", "stance_asymmetry", "cost_of_transport", "leg_torque_saturation",
-                "trunk_pitch_rms_deg", "trunk_roll_rms_deg"):
-        vals = [r["gait"][key] for r in ok if r["gait"] and r["gait"][key] is not None]
-        gait[key] = round(float(np.mean(vals)), 4) if vals else None
     return {
         "seed0": seed0,
         "damping_profile": damping_profile,
-        "gait_survivors_mean": gait,
+        "gait_survivors_mean": survivor_gait_means(res),
         "trials": trials,
         "survived": len(ok),
         "survival_rate": len(ok) / trials,
@@ -224,14 +187,33 @@ def evaluate(checkpoint: str | None, speed: float, trials: int = 20, seconds: fl
     }
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=None)
+def write_json(path: str, data: dict) -> None:
+    """Write atomically, so a reader never sees a half-written file."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--checkpoint", default=None, help="exported policy; default is Booster's k1_walk")
     ap.add_argument("--speed", type=float, required=True)
     ap.add_argument("--trials", type=int, default=20)
     ap.add_argument("--seconds", type=float, default=10.0)
-    ap.add_argument("--seed0", type=int, default=0, help="first trial seed (validation 0-19; final test uses 1000+)")
-    ap.add_argument("--damping_profile", default=None, help="joint damping profile (version 3: v3)")
+    ap.add_argument("--seed0", type=int, default=0, help="first trial seed (training gate 0-19; final test 1000+)")
+    ap.add_argument("--damping_profile", choices=sorted(DAMPING_PROFILES), default=None,
+                    help="v3 for policies from train_v3.py; omit for Booster's k1_walk")
+    ap.add_argument("--out", default=None, help="also write the full result, with every trial, to this JSON file")
     a = ap.parse_args()
+    if a.trials < 1 or a.speed < 0:
+        ap.error("--trials must be >= 1 and --speed >= 0")
     r = evaluate(a.checkpoint, a.speed, a.trials, a.seconds, a.seed0, a.damping_profile)
+    if a.out:
+        write_json(a.out, r)
     print(json.dumps({k: v for k, v in r.items() if k != "per_trial"}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
